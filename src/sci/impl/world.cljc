@@ -9,6 +9,7 @@
             [sci.impl.execution :as execution])
   #?@(:cljd []
       :clj [(:import [java.lang.ref WeakReference]
+                     [java.util WeakHashMap]
                      [java.util.concurrent.atomic AtomicReferenceArray]
                      [java.util.concurrent.locks ReentrantReadWriteLock])]))
 
@@ -108,13 +109,52 @@
                 (vreset! holder new))))))))
   world)
 
-(defn new-world []
+(defn- new-lineage-index
+  "A weak set of the worlds that share one registry. The sweep of dead
+   managed state clears the cells of each world in this set."
+  []
+  #?(:clj (WeakHashMap.)
+     :cljs (when (exists? js/WeakRef) (js/Set.))
+     :cljd nil))
+
+(defn- add-lineage-world! [^DenseWorld world]
+  (when-let [index (:worlds @(.-registry world))]
+    #?(:clj (locking index (.put ^WeakHashMap index world true))
+       :cljs (.add index (js/WeakRef. world))
+       :cljd nil))
+  world)
+
+(defn- lineage-worlds
+  "An eager strong snapshot of the live worlds of `registry`. The snapshot
+   also removes dead weak entries on cljs."
+  [registry]
+  (if-let [index (:worlds @registry)]
+    #?(:clj (locking index (vec (.keySet ^WeakHashMap index)))
+       :cljs (let [worlds (volatile! [])]
+               (.forEach index (fn [ref]
+                                 (if-let [world (.deref ref)]
+                                   (vswap! worlds conj world)
+                                   (.delete index ref))))
+               @worlds)
+       :cljd [])
+    []))
+
+(defn- new-world* []
   (DenseWorld.
    (volatile! (new-cells 64))
-   (atom {:next-slot 0 :descriptors {} :managed-descriptors []})
+   (atom {:next-slot 0 :descriptors {}
+          ;; managed-index → descriptor. A map, so the sweep can remove the
+          ;; descriptor of a dead owner without a shift of other indexes.
+          :managed-descriptors {} :next-managed-index 0
+          :managed-since-sweep 0 :managed-after-sweep 0
+          :worlds (new-lineage-index)
+          :sweep-lock #?(:clj (Object.) :default nil)})
    #?(:cljd nil :clj (ReentrantReadWriteLock.) :cljs nil)
    #?(:cljd nil :clj (ReentrantReadWriteLock.) :cljs nil)
    (volatile! false)))
+
+(defn new-world []
+  (add-lineage-world! (new-world*)))
 
 (defn active-world-state []
   #?(:cljd (execution/active-world)
@@ -335,6 +375,8 @@
                          (assoc-in [:descriptors handle] desc))))
             desc))))))
 
+(declare sweep-due? sweep-managed!)
+
 (defn register-managed!
   "Allocate dense slots whose owner carries the returned descriptor directly.
   Managed descriptors contain no owner reference, so an unreachable SCI ref is
@@ -352,7 +394,7 @@
                    (let [start (:next-slot @registry)
                          slots (mapv #(+ start %) (range (count values)))
                          fork-slots (mapv #(nth slots %) fork-indexes)
-                         managed-index (count (:managed-descriptors @registry))
+                         managed-index (:next-managed-index @registry)
                          desc {:kind kind
                                :managed-index managed-index
                                :slots slots
@@ -362,13 +404,17 @@
                             (fn [r]
                               (-> r
                                   (assoc :next-slot (+ start (count values)))
-                                  (update :managed-descriptors conj desc))))
+                                  (assoc :next-managed-index (inc managed-index))
+                                  (update :managed-since-sweep inc)
+                                  (assoc-in [:managed-descriptors managed-index] desc))))
                      desc)))]
       (ensure-capacity! world (:next-slot @registry))
       (with-cells-read-lock
         world
         #(doseq [[slot value] (map vector (:slots desc) values)]
            (cells-set! (current-cells world) slot value)))
+      (when (sweep-due? registry)
+        (sweep-managed! registry))
       (assoc desc :home world :registry registry))))
 
 (defn attach-managed-owner!
@@ -381,9 +427,13 @@
     (when owner-ref
       (with-registry-lock
         registry
-        #(swap! registry assoc-in
-                [:managed-descriptors managed-index :owner-ref]
-                owner-ref)))
+        #(swap! registry
+                (fn [r]
+                  ;; A descriptor without an owner counts as live, so the
+                  ;; sweep never removes it before this call.
+                  (if (contains? (:managed-descriptors r) managed-index)
+                    (assoc-in r [:managed-descriptors managed-index :owner-ref] owner-ref)
+                    r)))))
     owner))
 
 (defn- live-managed-owner? [owner-ref]
@@ -392,14 +442,65 @@
          :clj (some? (.get ^WeakReference owner-ref))
          :cljs (some? (.deref owner-ref)))))
 
-(defn- sweep-managed! [^DenseWorld world]
-  (let [cells (current-cells world)]
-    (doseq [{:keys [owner-ref slots]}
-            (:managed-descriptors @(.-registry world))
-            :when (not (live-managed-owner? owner-ref))
-            slot slots
-            :when (< slot (cells-length cells))]
-      (cells-set! cells slot absent))))
+(def ^:private sweep-min
+  "The smallest number of registrations between two sweeps of a lineage."
+  1024)
+
+(defn- with-sweep-lock
+  "Run `f` under the sweep lock of `registry`. The sweep and the cell copy of
+   a fork take this lock, so a fork cannot copy a value that the sweep clears."
+  [registry f]
+  #?(:clj (locking (:sweep-lock @registry) (f))
+     :default (f)))
+
+(defn- sweep-due?
+  "True when the lineage registered at least `sweep-min` managed values, and at
+   least as many as the last sweep kept, since the last sweep. The cost of a
+   sweep is the number of descriptors, so this keeps the sweep cost constant
+   per registration."
+  [registry]
+  (let [r @registry]
+    (>= (:managed-since-sweep r)
+        (max sweep-min (:managed-after-sweep r 0)))))
+
+(defn- sweep-managed!
+  "Release the values of managed state whose owner is dead. The sweep clears
+   the slots of each dead owner in every world of the lineage, then removes
+   the descriptors. A dead owner is unreachable, so no world reads these
+   slots again. Slots are not reused: a reused slot could show a stale value
+   in a world that the sweep did not reach. Returns the number of descriptors
+   removed."
+  [registry]
+  (with-sweep-lock
+    registry
+    (fn []
+      (let [dead (with-registry-lock
+                   registry
+                   (fn []
+                     (swap! registry assoc :managed-since-sweep 0)
+                     (into []
+                           (remove #(live-managed-owner? (:owner-ref (val %))))
+                           (:managed-descriptors @registry))))]
+        (when (seq dead)
+          (doseq [^DenseWorld world (lineage-worlds registry)]
+            (with-cells-read-lock
+              world
+              #(let [cells (current-cells world)
+                     n (cells-length cells)]
+                 (doseq [[_ {:keys [slots]}] dead
+                         slot slots
+                         :when (< slot n)]
+                   (cells-set! cells slot absent)))))
+          (with-registry-lock
+            registry
+            #(swap! registry update :managed-descriptors
+                    (fn [m] (persistent! (reduce (fn [m [i _]] (dissoc! m i))
+                                                 (transient m) dead))))))
+        (with-registry-lock
+          registry
+          #(swap! registry (fn [r] (assoc r :managed-after-sweep
+                                          (count (:managed-descriptors r))))))
+        (count dead)))))
 
 (defn managed-value
   "Read a self-described managed slot in the active related world, falling
@@ -867,7 +968,7 @@
         (execution/refresh-active-bindings! state)))))
 
 (defn- copy-world [^DenseWorld world fork-value]
-  (sweep-managed! world)
+  (sweep-managed! (.-registry world))
   (let [source (current-cells world)
         registry (.-registry world)
         registry-state @registry
@@ -882,8 +983,14 @@
                       #?(:cljd nil :clj (ReentrantReadWriteLock.) :cljs nil)
                       #?(:cljd nil :clj (ReentrantReadWriteLock.) :cljs nil)
                       (volatile! true))]
-    (dotimes [i logical-n]
-      (cells-set! target i (cells-get source i)))
+    ;; The sweep lock keeps a concurrent sweep out until the target is a
+    ;; member of the lineage. Then every later sweep reaches the target too.
+    (with-sweep-lock
+      registry
+      (fn []
+        (dotimes [i logical-n]
+          (cells-set! target i (cells-get source i)))
+        (add-lineage-world! target-world)))
     (when fork-value
       ;; Per-cell copiers establish target-local type/control realizations
       ;; before general Forkable values inspect the child world.
@@ -904,7 +1011,7 @@
                  :when (not (identical? absent v))]
            (cells-set! target value-slot
                        (if (contains? handles v) v (fork-value v))))
-         (doseq [{:keys [fork-slots]} managed-descriptors
+         (doseq [{:keys [fork-slots]} (vals managed-descriptors)
                  slot fork-slots
                  :when (< slot logical-n)
                  :let [v (cells-get target slot)]
